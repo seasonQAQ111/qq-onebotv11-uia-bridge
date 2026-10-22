@@ -724,14 +724,20 @@ class Bridge:
                 # the unread badge stop moving, so change detection alone waits
                 # forever. Open the chat and read it directly every
                 # force_read_seconds so an idle machine cannot swallow a night.
-                age = time.time() - self.last_read_ts.get(key, 0.0)
+                # last_read_ts only tracks this process, so a chat nobody has
+                # read yet says "not read yet" rather than pretending the epoch
+                # is a read time.
+                age = None
+                if key in self.last_read_ts:
+                    age = time.time() - self.last_read_ts[key]
                 # Only while nobody is at the keyboard: opening a chat raises
                 # QQ and clicks, which would interrupt somebody who is typing.
                 # The idle case is the one that silently loses a whole night.
-                if force and age >= force and self.idle_seconds() >= idle_needed:
+                if force and (age is None or age >= force) and self.idle_seconds() >= idle_needed:
                     out.append(chat)
-                    log("stale sweep: %s unread for %ds (machine idle %ds), reading it anyway"
-                        % (key, int(age), int(self.idle_seconds())))
+                    log("stale sweep: %s %s (machine idle %ds), reading it anyway"
+                        % (key, ("unread for %ds" % int(age)) if age is not None
+                           else "not read since this bridge started", int(self.idle_seconds())))
                 continue
             out.append(chat)
         return out
