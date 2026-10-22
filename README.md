@@ -40,7 +40,7 @@ QQ NT 桌面客户端  <--UIA-->  本桥接  <--OneBot v11 反向 WS-->  AstrBot
 ## 安装
 
 ```powershell
-git clone https://github.com/<you>/qq-onebot-uia-bridge.git
+git clone https://github.com/seasonQAQ111/qq-onebotv11-uia-bridge.git
 cd qq-onebot-uia-bridge
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
