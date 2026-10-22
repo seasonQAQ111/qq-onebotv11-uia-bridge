@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# runtime state and logs (the bridge creates these)
+logs/
+*.log
+
+# personal configuration: copy scripts/bridge-config.example.json instead
+scripts/bridge-config.json
+scripts/bridge-seen.json
+
+# local environment / virtualenv
+.env
+.venv/
