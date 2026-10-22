@@ -21,13 +21,15 @@
 [CmdletBinding()]
 param(
     [int]$IntervalSeconds = 30,
-    [int]$StartupGraceSeconds = 25
+    [int]$StartupGraceSeconds = 25,
+    [string]$Config
 )
 
 $ErrorActionPreference = 'Continue'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root      = Split-Path -Parent $ScriptDir
 $LogDir    = Join-Path $Root 'logs'
+if (-not $Config) { $Config = Join-Path $ScriptDir 'bridge-config.json' }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 $WatchLog = Join-Path $LogDir 'uia-bridge-watch.log'
@@ -45,6 +47,28 @@ function Get-BridgeProcesses {
         Where-Object { $_.CommandLine -match 'onebot_uia_bridge' })
 }
 
+function Get-BridgeMutexName([string]$ConfigPath) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($ConfigPath)
+    $safe = [regex]::Replace($stem, '[^A-Za-z0-9._-]', '_')
+    if (-not $safe) { $safe = 'default' }
+    return 'onebot_uia_bridge_' + $safe
+}
+
+function Test-BridgeRunning([string]$ConfigPath) {
+    # The bridge holds a named mutex while it runs. That is the one signal that
+    # still works when its command line cannot be read (elevated, another user),
+    # which is exactly the case where a process scan misses it and a second
+    # bridge gets started on top - and then AstrBot answers every message twice.
+    try {
+        $m = [System.Threading.Mutex]::OpenExisting((Get-BridgeMutexName $ConfigPath))
+        $m.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+
 function Test-QqRunning {
     @(Get-Process -Name 'QQ' -ErrorAction SilentlyContinue).Count -gt 0
 }
@@ -55,7 +79,7 @@ while ($true) {
         Start-Sleep -Seconds $IntervalSeconds
         continue
     }
-    if ((Get-BridgeProcesses).Count -eq 0) {
+    if ((Get-BridgeProcesses).Count -eq 0 -and -not (Test-BridgeRunning $Config)) {
         if (-not (Test-QqRunning)) {
             Write-Line 'QQ is not running - leaving the bridge alone'
             Start-Sleep -Seconds $IntervalSeconds

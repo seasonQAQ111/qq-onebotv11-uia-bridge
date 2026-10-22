@@ -1219,6 +1219,46 @@ class Bridge:
             await asyncio.sleep(5)
 
 
+def single_instance_name(config_path):
+    """Mutex name shared with the start/watch scripts (config name, cleaned)."""
+    stem = os.path.splitext(os.path.basename(str(config_path)))[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", stem) or "default"
+    return "onebot_uia_bridge_" + safe
+
+
+def claim_single_instance(config_path):
+    """Take a named-mutex lease for this config; False if one is already held.
+
+    Two bridges pointed at one AstrBot make every message arrive twice: AstrBot
+    does not dedupe across WebSocket clients, and both copies also drive the
+    same QQ window. Scanning the process list cannot see a bridge whose command
+    line is unreadable, so the lease lives in the kernel instead, where every
+    process on the machine sees the same object.
+
+    Returns the mutex handle (hold it for the process lifetime), None when the
+    platform offers no mutex, or False when another bridge already holds it.
+    """
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    name = single_instance_name(config_path)
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        log("could not create the single-instance mutex %s (error %s)"
+            % (name, ctypes.get_last_error()))
+        return None
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return False
+    return handle
+
+
 def main():
     ap = argparse.ArgumentParser(description="UIA -> OneBot v11 bridge for AstrBot")
     ap.add_argument("--config", default=DEFAULT_CONFIG)
@@ -1226,6 +1266,15 @@ def main():
     ap.add_argument("--selfcheck", action="store_true",
                     help="attach to QQ, report config vs live sessions, then exit")
     args = ap.parse_args()
+    if not args.selfcheck:
+        # --selfcheck only reads QQ and never opens a socket, so it may run next
+        # to a live bridge; every other mode must be the only one for a config.
+        guard = claim_single_instance(args.config)
+        if guard is False:
+            log("another bridge is already running for %s - refusing to start" % args.config)
+            log("two bridges on one AstrBot deliver every message twice")
+            log("run scripts\\stop-bridge.ps1 first if you really want a new one")
+            sys.exit(3)
     with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
     bridge = Bridge(cfg, dry_run=args.dry_run)

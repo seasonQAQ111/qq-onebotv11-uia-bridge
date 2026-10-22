@@ -27,6 +27,9 @@ QQ NT 桌面客户端  <--UIA-->  本桥接  <--OneBot v11 反向 WS-->  AstrBot
   但桥接拒绝往回发，提示词和 @ 都无法在计时结束前把它唤醒。
   群聊默认要求指名（或 @）才会上闸，避免群友互怼误伤。
 - **保活**：`keep_awake` 持有 `ES_SYSTEM_REQUIRED`，防止系统睡眠导致机器人停摆。
+- **单实例锁**：桥接运行期间持有按配置名命名的 Windows 互斥体，同一个配置再启动第二份会被直接拒绝（退出码 3）。
+  看门狗也用这把锁判断存活，因此即使那份桥接的命令行读不到（以管理员或其他用户启动），也不会被误判成“没在跑”而再拉一份起来。
+  两个桥接同时连一个 AstrBot 时，AstrBot 不去重，每条消息会推两遍。
 - **看门狗**：`watch-bridge.ps1` 常驻后台，进程掉了就拉起来；主动停止会写
   一个 hold 文件，看门狗看到后完全放手，不会把刚停掉的桥接又拉回来。
 
@@ -80,6 +83,8 @@ powershell -File scripts\start-bridge.ps1 -DryRun
 # 正式启动
 powershell -File scripts\start-bridge.ps1
 ```
+
+重复启动会被拒绝（退出码 3）：一个配置同时只能有一份桥接在跑，先 `stop-bridge.ps1` 再启动。
 
 日志写在 `logs\uia-bridge.log`，Python 解释器默认取仓库根目录的 `.venv`，
 也可以用 `-Python` 指定。

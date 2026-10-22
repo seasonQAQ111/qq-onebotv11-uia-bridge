@@ -52,6 +52,28 @@ function Get-BridgeProcesses {
         Where-Object { $_.CommandLine -match 'onebot_uia_bridge' })
 }
 
+function Get-BridgeMutexName([string]$ConfigPath) {
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($ConfigPath)
+    $safe = [regex]::Replace($stem, '[^A-Za-z0-9._-]', '_')
+    if (-not $safe) { $safe = 'default' }
+    return 'onebot_uia_bridge_' + $safe
+}
+
+function Test-BridgeRunning([string]$ConfigPath) {
+    # The bridge holds a named mutex while it runs. That is the one signal that
+    # still works when its command line cannot be read (elevated, another user),
+    # which is exactly the case where a process scan misses it and a second
+    # bridge gets started on top - and then AstrBot answers every message twice.
+    try {
+        $m = [System.Threading.Mutex]::OpenExisting((Get-BridgeMutexName $ConfigPath))
+        $m.Dispose()
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+
 $Py     = Resolve-Python $Python
 $Bridge = Join-Path $ScriptDir 'onebot_uia_bridge.py'
 
@@ -87,6 +109,16 @@ Get-BridgeProcesses | ForEach-Object {
     Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Start-Sleep -Milliseconds 600
+
+# A bridge that was started elevated (or by another user) has an unreadable
+# command line, so the scan above cannot find it - but its mutex is still there.
+# Starting a second bridge anyway would make AstrBot answer every message twice.
+if (Test-BridgeRunning $Config) {
+    Write-Error ("a bridge for {0} is still running and could not be stopped from here." -f $Config)
+    Write-Host 'Its command line is unreadable, which usually means it was started elevated or by another user.'
+    Write-Host 'Stop it in that window, then start this one again.'
+    exit 3
+}
 
 $argList = @($Bridge, '--config', $Config)
 if ($DryRun) { $argList += '--dry-run' }
