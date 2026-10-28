@@ -20,10 +20,15 @@ QQ NT 桌面客户端  <--UIA-->  本桥接  <--OneBot v11 反向 WS-->  AstrBot
 - **惰性巡检**：Chromium 在窗口被最小化或完全遮挡时停止重绘，会话行会“冻住”，
   变化检测就会漏消息。`force_read_seconds` 配合 `force_read_idle_seconds`
   在人离开键盘足够久之后强制进入每个会话读一遍，兜住这种情况。
+- **重绘去重**：正常轮询使用 UIA `RuntimeId` 区分连续发送的相同文本；窗口隐藏后
+  重新打开时，Chromium 会重建控件并更换全部 `RuntimeId`。桥接同时保存
+  “发送者 + 内容 + 顺序”序列，用它与上一快照对齐，只推送尾部真正新增的消息，
+  不会在惰性巡检时重放整段旧历史。
 - **图片**：AstrBot 发来的 `base64://` 图片段先落到 `logs\uia-outgoing`，
   再通过剪贴板粘贴进 QQ 编辑器，发送结果同样做校验。
-- **闭麦闸门**：有人让机器人“闭嘴”时，该会话被关麦 `mute_seconds`。
-  关闭的是**嘴不是耳朵**：消息照常推给 AstrBot，记忆和上下文不断，
+- **可选闭麦闸门**：兼容模式下可让桥接在收到“闭嘴”后关闭该会话的发送能力 `mute_seconds`；
+  默认 `mute_enabled=false`，推荐由 AstrBot 插件事先做 LLM 判断。
+  启用后关闭的是**嘴不是耳朵**：消息照常推给 AstrBot，记忆和上下文不断，
   但桥接拒绝往回发，提示词和 @ 都无法在计时结束前把它唤醒。
   群聊默认要求指名（或 @）才会上闸，避免群友互怼误伤。
 - **保活**：`keep_awake` 持有 `ES_SYSTEM_REQUIRED`，防止系统睡眠导致机器人停摆。
@@ -64,6 +69,7 @@ Copy-Item scripts\bridge-config.example.json scripts\bridge-config.json
 | `members` / `chats[].members` | QQ 号 -> 昵称，作为昵称解析的回退表 |
 | `read_mode` | `watch`（默认）/ `active` / `cycle` |
 | `window_account` | 同机登录两个 QQ 时，用左侧栏昵称指定要驱动的那个窗口 |
+| `qq_path` / `qq_reopen_idle_seconds` | 可选。QQ 窗口消失后，仅在电脑连续空闲达到指定秒数时重新打开客户端 |
 | `force_read_seconds` / `force_read_idle_seconds` | 惰性巡检周期，以及只有在人离开键盘多久之后才执行 |
 | `mute_seconds` / `mute_keywords` / `mute_trigger_names` | 闭麦闸门 |
 | `keep_awake` | 是否阻止系统睡眠 |

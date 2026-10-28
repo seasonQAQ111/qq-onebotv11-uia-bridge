@@ -61,6 +61,13 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 GA_ROOT = 2
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_SHOWWINDOW = 0x0040
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
 
 QQ_WINDOW_CLASS = "Chrome_WidgetWin_1"
 RENDERER_CLASS = "Chrome_RenderWidgetHostHWND"
@@ -183,7 +190,7 @@ def find_qq_windows():
     def cb(hwnd, _):
         pid = ctypes.c_ulong()
         user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid.value not in pids or not user32.IsWindowVisible(hwnd):
+        if pid.value not in pids:
             return True
         cls = ctypes.create_unicode_buffer(64)
         user32.GetClassNameW(hwnd, cls, 64)
@@ -191,6 +198,10 @@ def find_qq_windows():
             return True
         title = ctypes.create_unicode_buffer(256)
         user32.GetWindowTextW(hwnd, title, 256)
+        # Closing QQ to tray hides the main window. It is still a valid UIA
+        # target and can be restored, so do not discard it as "not running".
+        if not user32.IsWindowVisible(hwnd) and title.value != "QQ":
+            return True
         results.append((hwnd, title.value))
         return True
 
@@ -345,23 +356,78 @@ class QQWindow:
         x, y = int(x), int(y)
         root = _window_at(x, y)
         if root != self.hwnd:
+            self.force_foreground()
+            root = _window_at(x, y)
+
+        temporary_topmost = False
+        was_topmost = bool(user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)
+        if root != self.hwnd and not was_topmost:
+            # Windows can deny SetForegroundWindow when the bridge runs from a
+            # background process. Briefly raising QQ above other windows makes
+            # the target pixel belong to QQ again; the click then activates it.
+            user32.SetWindowPos(
+                self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            )
+            time.sleep(0.15)
+            temporary_topmost = True
+            root = _window_at(x, y)
+
+        if root != self.hwnd:
+            if temporary_topmost:
+                user32.SetWindowPos(
+                    self.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                )
             raise RuntimeError("%s: refusing to click (%d,%d) - that point belongs to %s, "
                                "not to the QQ window %s"
                                % (label or "click", x, y, _window_desc(root),
                                   _window_desc(self.hwnd)))
-        user32.SetCursorPos(x, y)
-        time.sleep(0.05)
-        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-        time.sleep(0.05)
-        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-        time.sleep(wait)
+        try:
+            user32.SetCursorPos(x, y)
+            time.sleep(0.05)
+            user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+            time.sleep(0.05)
+            user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            time.sleep(wait)
+        finally:
+            if temporary_topmost:
+                user32.SetWindowPos(
+                    self.hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                )
 
     def click_node(self, node, label=""):
-        """Click the centre of a UIA element after checking who owns the point."""
+        """Click a point inside a UIA element after checking who owns it.
+
+        The input-method candidate window (Sogou's SoPY_Comp and friends) is a
+        separate window that can sit right on the centre of the editor. The
+        ownership check then refuses the click - correctly, because that pixel
+        belongs to the IME - and the message is dropped with "refusing to
+        click". Try a few points inside the element instead and take the first
+        one that really belongs to QQ.
+        """
         r = _nrect(node)
         if r is None or (r.right - r.left) <= 0 or (r.bottom - r.top) <= 0:
             raise RuntimeError("%s: element has no usable geometry" % (label or "click"))
-        self.click((r.left + r.right) // 2, (r.top + r.bottom) // 2, label)
+        w, h = r.right - r.left, r.bottom - r.top
+        pad_x, pad_y = max(6, w // 10), max(6, h // 4)
+        points = (
+            (r.left + w // 2, r.top + h // 2),
+            (r.left + pad_x, r.top + h // 2),
+            (r.right - pad_x, r.top + h // 2),
+            (r.left + pad_x, r.bottom - pad_y),
+            (r.right - pad_x, r.bottom - pad_y),
+        )
+        first_error = None
+        for x, y in points:
+            try:
+                self.click(x, y, label)
+                return
+            except RuntimeError as exc:
+                if first_error is None:
+                    first_error = exc
+        raise first_error
 
     def alive(self):
         return bool(self.hwnd) and bool(_safe(lambda: user32.IsWindow(self.hwnd)))
@@ -370,7 +436,7 @@ class QQWindow:
         if not self.hwnd:
             return False
         try:
-            if user32.IsIconic(self.hwnd):
+            if not user32.IsWindowVisible(self.hwnd) or user32.IsIconic(self.hwnd):
                 user32.ShowWindow(self.hwnd, SW_RESTORE)
             if user32.GetForegroundWindow() == self.hwnd:
                 return True
@@ -646,7 +712,18 @@ class QQWindow:
             text = (text + " [" + IMAGE_TAG + "]") if text else ("[" + IMAGE_TAG + "]")
         if not sender and not text:
             return None
-        return {"sender": sender, "text": text, "is_self": is_self}
+        runtime_id = _safe(lambda: item.GetRuntimeId(), None)
+        if runtime_id is not None:
+            try:
+                runtime_id = [int(part) for part in runtime_id]
+            except Exception:
+                runtime_id = str(runtime_id)
+        return {
+            "sender": sender,
+            "text": text,
+            "is_self": is_self,
+            "native_id": runtime_id,
+        }
     def read_messages(self):
         """Return the visible messages of the open chat, oldest first."""
         ml = self._msg_list()

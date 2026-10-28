@@ -46,6 +46,7 @@ import json
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -60,14 +61,12 @@ import qq_uia  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CONFIG = os.path.join(HERE, "bridge-config.json")
 
-AT_MARK = "Bot"  # fallback self nickname; self_nickname in the config wins
+AT_MARK = "\u6d77\u65f6"  # default self nickname used for @ detection
 
 # --- mute gate ---------------------------------------------------------------
-# Someone telling the bot to shut up (the bot's name plus a keyword below) parks the conversation for
-# mute_seconds. The bot keeps READING that conversation - every message still
-# goes to AstrBot, so memory and context stay intact - but the bridge refuses to
-# send anything back, so no prompt and no @ can make it talk before the timer
-# runs out. Set mute_swallow_inbound if you would rather it not even read.
+# Legacy fallback only. AstrBot's astrbot_plugin_chat_silence now owns mute
+# decisions with LLM classification and per-chat state. Keep mute_enabled=false
+# in normal operation so the bridge never becomes a second, global gate.
 # The keyword list lives in bridge-config.json as well; this is the fallback.
 DEFAULT_MUTE_SECONDS = 1800
 DEFAULT_MUTE_KEYWORDS = [
@@ -85,6 +84,24 @@ def log(*a):
 
 def now_ts():
     return int(time.time())
+
+
+def user_idle_seconds():
+    """Seconds since the last keyboard or mouse input anywhere on the box."""
+    try:
+        import ctypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        now = ctypes.windll.kernel32.GetTickCount()
+        return max(0.0, ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0)
+    except Exception:
+        return 0.0
 
 
 def chat_key(chat):
@@ -147,15 +164,27 @@ def describe_parts(parts):
 def sig_of(m):
     """Identity of a message for diffing.
 
-    Only is_self + text: QQ fills the sender element in a beat after the rest
-    of the bubble, so two reads of the same message can carry "" and the
-    nickname respectively. With the sender in the key those reads look like
-    different messages and AstrBot gets the message twice.
+    Prefer the Chromium UIA RuntimeId. Text alone collapses repeated messages
+    such as "OK" or "[image]" into one signature, which can both suppress a
+    genuinely new message and make a redraw look new.
     """
-    return (bool(m.get("is_self")), m.get("text", ""))
+    native_id = m.get("native_id")
+    if native_id is not None:
+        if isinstance(native_id, (list, tuple)):
+            native_id = ".".join(str(part) for part in native_id)
+        return (bool(m.get("is_self")), "uia:" + str(native_id))
+    return (bool(m.get("is_self")), "text:" + str(m.get("text", "")))
 
 
-def diff_since(prev_sigs, cur):
+def content_sig_of(m):
+    """Identity that survives Chromium destroying and rebuilding its UIA nodes."""
+    return (
+        bool(m.get("is_self")),
+        "content:%s\0%s" % (m.get("sender", ""), m.get("text", "")),
+    )
+
+
+def diff_since(prev_sigs, cur, sig_fn=sig_of):
     """(fresh messages, trusted).
 
     QQ keeps only the tail of a conversation on screen, so the snapshot slides
@@ -169,7 +198,7 @@ def diff_since(prev_sigs, cur):
     partial re-render could hand AstrBot the same message twice and it would
     answer twice.
     """
-    cur_sigs = [sig_of(m) for m in cur]
+    cur_sigs = [sig_fn(m) for m in cur]
     if not prev_sigs:
         return list(cur), True
     for k in range(min(len(prev_sigs), len(cur_sigs)), 0, -1):
@@ -178,12 +207,33 @@ def diff_since(prev_sigs, cur):
     budget = collections.Counter(prev_sigs)
     fresh = []
     for m in cur:
-        s = sig_of(m)
+        s = sig_fn(m)
         if budget[s] > 0:
             budget[s] -= 1
         else:
             fresh.append(m)
     return fresh, False
+
+
+def tail_overlap(left_sigs, right_sigs):
+    """Length of the longest prefix of right that is the tail of left."""
+    left = list(left_sigs)
+    right = list(right_sigs)
+    for k in range(min(len(left), len(right)), 0, -1):
+        if right[:k] == left[-k:]:
+            return k
+    return 0
+
+
+def short_snapshot_stable(first, second):
+    """True when two short reads describe substantially the same tail."""
+    if not first or not second:
+        return False
+    first_sigs = [content_sig_of(m) for m in first]
+    second_sigs = [content_sig_of(m) for m in second]
+    required = min(4, len(first_sigs), len(second_sigs))
+    return required > 0 and tail_overlap(first_sigs, second_sigs) >= required
+
 
 class UiaBackend:
     """Every QQ client touch. Only ever called from the bridge worker thread."""
@@ -192,11 +242,20 @@ class UiaBackend:
         self.cfg = cfg
         self.qq = None
         self.lock = threading.RLock()
+        self.last_qq_launch_ts = 0.0
 
     # ---- attach ----
 
     def expect_names(self):
         return [c["name"] for c in (self.cfg.get("chats") or []) if c.get("name")]
+
+    def _connect_once(self):
+        account = str(self.cfg.get("window_account") or "").strip()
+        self.qq = qq_uia.QQWindow().connect(expect=self.expect_names(), account=account or None)
+        log("QQ attached: account=%r window=%s renderer=%s" % (
+            account or self.qq.account_nickname(),
+            hex(self.qq.hwnd),
+            hex(self.qq.renderer_hwnd) if self.qq.renderer_hwnd else None))
 
     def connect(self):
         """Attach to the QQ window that actually holds the watched chats.
@@ -207,12 +266,33 @@ class UiaBackend:
         console UI) and otherwise the candidates are scored by their session
         lists.
         """
-        account = str(self.cfg.get("window_account") or "").strip()
-        self.qq = qq_uia.QQWindow().connect(expect=self.expect_names(), account=account or None)
-        log("QQ attached: account=%r window=%s renderer=%s" % (
-            account or self.qq.account_nickname(),
-            hex(self.qq.hwnd),
-            hex(self.qq.renderer_hwnd) if self.qq.renderer_hwnd else None))
+        try:
+            self._connect_once()
+            return
+        except RuntimeError as exc:
+            if "QQ window not found" not in str(exc):
+                raise
+
+        qq_path = str(self.cfg.get("qq_path") or "")
+        reopen_idle = max(
+            30.0,
+            float(self.cfg.get("qq_reopen_idle_seconds", 120) or 120),
+        )
+        now = time.time()
+        if (qq_path and os.path.isfile(qq_path)
+                and user_idle_seconds() >= reopen_idle
+                and now - self.last_qq_launch_ts >= 30):
+            log("QQ window missing and the machine is idle; reopening the desktop client")
+            subprocess.Popen([qq_path], cwd=os.path.dirname(qq_path))
+            self.last_qq_launch_ts = now
+            for _ in range(12):
+                time.sleep(1)
+                try:
+                    self._connect_once()
+                    return
+                except Exception:
+                    pass
+        raise RuntimeError("QQ window not found")
 
     def reselect(self, reason):
         """Re-pick the QQ window after a failure that smells like a wrong one."""
@@ -358,12 +438,15 @@ class Bridge:
         self.sweep_every = int(cfg.get("sweep_every", 10) or 0)
         self.sweep_idle = float(cfg.get("sweep_idle_seconds", 60) or 0)
         self.last_read_ts = {}
+        self.read_retry_after = {}  # chat key -> wall-clock retry time
         self.markers = {}     # chat key -> (preview, time, unread>0)
         self.history = {}     # chat key -> [signature, ...]
+        self.content_history = {}  # chat key -> [repaint-stable signature, ...]
         self.reported = {}    # chat key -> Counter of signatures already pushed
         self.reported_order = {}   # chat key -> FIFO used to cap that Counter
         self.recent_text = {}      # chat key -> deque of (text, when) pushed
         self.deferred = {}    # chat key -> chat held back during a send burst
+        self.forced_reads = set()  # chats opened by the periodic safety sweep
         self.last_send_ts = 0.0
         self.read_once = set()     # chat keys already read once in this process
         state_path = str(cfg.get("state_path") or "")
@@ -376,6 +459,7 @@ class Bridge:
         self.load_state()
 
         # ---------- mute gate state ----------
+        self.mute_enabled = bool(cfg.get("mute_enabled", False))
         try:
             self.mute_seconds = int(cfg.get("mute_seconds", DEFAULT_MUTE_SECONDS) or DEFAULT_MUTE_SECONDS)
         except (TypeError, ValueError):
@@ -589,21 +673,7 @@ class Bridge:
 
     @staticmethod
     def idle_seconds():
-        """Seconds since the last keyboard or mouse input anywhere on the box."""
-        try:
-            import ctypes
-
-            class LASTINPUTINFO(ctypes.Structure):
-                _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-            info = LASTINPUTINFO()
-            info.cbSize = ctypes.sizeof(info)
-            if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
-                return 0.0
-            now = ctypes.windll.kernel32.GetTickCount()
-            return max(0.0, ((now - info.dwTime) & 0xFFFFFFFF) / 1000.0)
-        except Exception:
-            return 0.0
+        return user_idle_seconds()
 
     @staticmethod
     def hold_awake():
@@ -635,13 +705,22 @@ class Bridge:
     def _worker_body(self):
         if bool(self.cfg.get("keep_awake", True)):
             self.hold_awake()
+        last_attach_log = 0.0
+        while True:
+            try:
+                self.backend.connect()
+                break
+            except Exception as e:
+                now = time.time()
+                if now - last_attach_log >= 60:
+                    log("QQ is not visible yet; waiting to attach: %s" % e)
+                    last_attach_log = now
+                time.sleep(5)
         try:
-            self.backend.connect()
             self.prune_outbox()
             self.selfcheck()
         except Exception as e:
-            log("FATAL: cannot attach to QQ: %s" % e)
-            os._exit(2)
+            log("initial QQ inspection failed; continuing: %s" % e)
         interval = float(self.cfg.get("poll_interval", 3.0))
         last_poll = 0.0
         while True:
@@ -706,8 +785,11 @@ class Bridge:
         force = max(0.0, float(self.cfg.get("force_read_seconds", 300) or 0))
         idle_needed = max(0.0, float(self.cfg.get("force_read_idle_seconds", 60) or 0))
         out = []
+        now = time.time()
         for chat in self.chats:
             key = chat_key(chat)
+            if now < self.read_retry_after.get(key, 0.0):
+                continue
             info = until.get(chat["name"])
             if info is None:
                 idle = time.time() - self.last_read_ts.get(key, 0.0)
@@ -734,6 +816,7 @@ class Bridge:
                 # QQ and clicks, which would interrupt somebody who is typing.
                 # The idle case is the one that silently loses a whole night.
                 if force and (age is None or age >= force) and self.idle_seconds() >= idle_needed:
+                    self.forced_reads.add(key)
                     out.append(chat)
                     log("stale sweep: %s %s (machine idle %ds), reading it anyway"
                         % (key, ("unread for %ds" % int(age)) if age is not None
@@ -769,10 +852,17 @@ class Bridge:
         origin = self.backend.current_chat()
         touched = False
         for chat in todo:
+            key = chat_key(chat)
             try:
                 self.collect(chat)
+                self.read_retry_after.pop(key, None)
                 touched = True
             except Exception as e:
+                cooldown = max(
+                    5.0,
+                    float(self.cfg.get("read_error_backoff_seconds", 15) or 15),
+                )
+                self.read_retry_after[key] = time.time() + cooldown
                 log("read error for %s: %s" % (chat["name"], e))
         if touched and origin and self.cfg.get("restore_after_read", True):
             if self.backend.current_chat() != origin:
@@ -781,11 +871,22 @@ class Bridge:
                 except Exception as e:
                     log("could not restore %r: %s" % (origin, e))
     @staticmethod
-    def _looks_partial(prev_sigs, msgs):
-        """A snapshot far smaller than the last one is a half-drawn list."""
+    def _looks_partial(prev_sigs, msgs, sig_fn=sig_of):
+        """Is this snapshot half drawn, or just a shorter view of the chat?
+
+        QQ keeps about one screen of rows per conversation and that screen is
+        not the same size everywhere: the private chat renders nine rows where
+        a group rendered twenty-one. Judging by length alone therefore threw
+        away every private read ("ignoring a short snapshot ... 9 had 21") and
+        private messages stopped reaching AstrBot. A short list is only
+        suspect when its tail does not line up with the previous one.
+        """
         if not msgs:
             return True
-        return len(prev_sigs) >= 4 and len(msgs) <= len(prev_sigs) // 2
+        if len(prev_sigs) < 4 or len(msgs) > len(prev_sigs) // 2:
+            return False
+        cur_sigs = [sig_fn(m) for m in msgs]
+        return tail_overlap(prev_sigs, cur_sigs) == 0
 
     def collect(self, chat):
         """Read one conversation and push whatever is new to AstrBot."""
@@ -793,42 +894,93 @@ class Bridge:
         if msgs is None:
             return
         key = chat_key(chat)
+        forced = key in self.forced_reads
+        self.forced_reads.discard(key)
         first_read = key not in self.read_once
         prev = self.history.get(key)
+        prev_content = self.content_history.get(key)
 
-        if prev is None:
-            log("baseline %s: %d messages" % (key, len(msgs)))
+        # The first successful snapshot after a bridge restart is always a
+        # baseline. It may contain hours of history loaded by a fresh QQ
+        # login, so even a "trusted" diff must not be forwarded to AstrBot.
+        if first_read:
+            log("baseline %s after start: %d messages" % (key, len(msgs)))
             self._remember(key, msgs)
             self.history[key] = [sig_of(m) for m in msgs][-400:]
+            self.content_history[key] = [content_sig_of(m) for m in msgs][-400:]
             self.read_once.add(key)
             self.save_state()
             return
 
-        if self._looks_partial(prev, msgs):
-            # Chromium hands back a partially drawn list now and then. Writing
-            # that into history would make the next full snapshot look like a
-            # flood of new messages, so the old history is kept instead.
-            log("ignoring a short snapshot for %s (%d messages, had %d)"
-                % (key, len(msgs), len(prev)))
-            return
+        prev_shape = prev
+        shape_sig = sig_of
+        if prev and prev_content:
+            runtime_overlap = tail_overlap(prev, [sig_of(m) for m in msgs])
+            if runtime_overlap == 0:
+                prev_shape = prev_content
+                shape_sig = content_sig_of
+
+        if self._looks_partial(prev_shape, msgs, shape_sig):
+            # A short view can mean either that Chromium is still repainting or
+            # that every older row really has scrolled off. Re-read it instead
+            # of dropping it forever: a complete page stays aligned, while a
+            # half-rendered one usually changes on the next UIA snapshot.
+            confirmed = None
+            for _ in range(2):
+                time.sleep(0.45)
+                retry = self.backend.read_chat(chat)
+                if retry is None:
+                    continue
+                if (not self._looks_partial(prev_shape, retry, shape_sig)
+                        or short_snapshot_stable(msgs, retry)):
+                    confirmed = retry
+                    break
+                msgs = retry
+            if confirmed is None:
+                # Never block a chat indefinitely. The reported-signature
+                # counter below still suppresses anything already delivered.
+                confirmed = msgs
+                log("short snapshot for %s changed while reading; accepting latest view (%d messages, had %d)"
+                    % (key, len(msgs), len(prev)))
+            else:
+                log("short snapshot for %s confirmed after redraw (%d messages, had %d)"
+                    % (key, len(confirmed), len(prev)))
+            msgs = confirmed
 
         self.last_read_ts[key] = time.time()
         fresh, trusted = diff_since(prev, msgs)
+        if not trusted and prev_content:
+            content_fresh, content_trusted = diff_since(
+                prev_content, msgs, sig_fn=content_sig_of
+            )
+            if content_trusted:
+                log("reconciled repainted snapshot for %s: %d new message(s)"
+                    % (key, len(content_fresh)))
+                fresh = content_fresh
+                trusted = True
+
+        cur_sigs = [sig_of(m) for m in msgs]
+        cur_content = [content_sig_of(m) for m in msgs]
         if trusted:
-            self.history[key] = [sig_of(m) for m in msgs][-400:]
-        elif first_read:
-            # The first snapshot after a restart does not line up with what the
-            # previous process already reported (QQ redraws or slides the list).
-            # Replying to it would answer messages that were handled minutes
-            # ago, so this read only re-seeds the comparison state.
-            log("re-baseline %s without replying (first read, %d messages, %d known)"
-                % (key, len(msgs), len(prev)))
-            self._remember(key, msgs)
-            self.history[key] = [sig_of(m) for m in msgs][-400:]
-            self.read_once.add(key)
-            self.save_state()
-            return
+            if len(cur_sigs) >= len(prev):
+                self.history[key] = cur_sigs[-400:]
+            else:
+                # A shorter but valid tail view: keep the older signatures so
+                # the next full snapshot does not look like a flood of new
+                # messages, and append only what this read actually added.
+                self.history[key] = (list(prev) + [sig_of(m) for m in fresh])[-400:]
         else:
+            if forced:
+                # The periodic safety read had to reopen a hidden conversation,
+                # so Chromium replaced every RuntimeId. If even the repaint-
+                # stable sequence cannot be aligned, replaying this screen
+                # would send old history to AstrBot again. Re-baseline instead.
+                log("forced read %s had no trusted overlap; ignoring snapshot" % key)
+                self.history[key] = cur_sigs[-400:]
+                self.content_history[key] = cur_content[-400:]
+                self.read_once.add(key)
+                self.save_state()
+                return
             already = self.reported.get(key) or collections.Counter()
             window = float(self.cfg.get("dedupe_window_seconds", 180) or 0)
             now = time.time()
@@ -845,6 +997,14 @@ class Bridge:
             log("untrusted snapshot for %s: %d of %d messages looked new"
                 % (key, len(kept), len(msgs)))
             fresh = kept
+
+        if trusted and len(cur_content) < len(prev_content or []):
+            self.content_history[key] = (
+                list(prev_content or [])
+                + [content_sig_of(m) for m in fresh]
+            )[-400:]
+        else:
+            self.content_history[key] = cur_content[-400:]
 
         for m in fresh:
             self._mark_reported(key, m)
@@ -908,6 +1068,12 @@ class Bridge:
                 hist = [(bool(s[0]), str(s[1])) for s in (item.get("history") or [])]
                 if hist:
                     self.history[key] = hist[-400:]
+                content_hist = [
+                    (bool(s[0]), str(s[1]))
+                    for s in (item.get("content_history") or [])
+                ]
+                if content_hist:
+                    self.content_history[key] = content_hist[-400:]
                 counter = collections.Counter()
                 for entry in (item.get("reported") or []):
                     counter[(bool(entry[0]), str(entry[1]))] += int(entry[2])
@@ -938,6 +1104,10 @@ class Bridge:
             recent = self.recent_text.get(key) or collections.deque()
             chats[key] = {
                 "history": [[bool(s[0]), s[1]] for s in hist[-400:]],
+                "content_history": [
+                    [bool(s[0]), s[1]]
+                    for s in (self.content_history.get(key) or [])[-400:]
+                ],
                 "reported": [[bool(s[0]), s[1], int(n)] for s, n in counter.items()],
                 "recent": [[t, ts] for t, ts in recent if now - ts < window],
             }
@@ -947,7 +1117,7 @@ class Bridge:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"version": 1, "chats": chats}, fh, ensure_ascii=False)
+                json.dump({"version": 2, "chats": chats}, fh, ensure_ascii=False)
             os.replace(tmp, path)
         except Exception as e:
             log("could not write dedupe state: %s" % e)
@@ -1013,6 +1183,8 @@ class Bridge:
 
     def mute_scan(self, key, chat, text):
         """Arm (or re-arm) the gate when this message tells the bot to shut up."""
+        if not self.mute_enabled:
+            return False
         keyword = self.mute_hit(text)
         if keyword and self.mute_armed_here(chat, text):
             self.mute_chat(key, chat["name"], keyword)
@@ -1027,7 +1199,7 @@ class Bridge:
         whole, and only the reply is stopped. Turn mute_swallow_inbound on if a
         conversation should go fully dark instead.
         """
-        if not self.mute_swallow_inbound:
+        if not self.mute_enabled or not self.mute_swallow_inbound:
             return False
         if not self.is_muted(key):
             return False
@@ -1121,7 +1293,7 @@ class Bridge:
             return self.failed("%r is configured twice, so the session list cannot "
                                "tell the two rows apart (key %s)" % (chat["name"], key))
 
-        if self.is_muted(key):
+        if self.mute_enabled and self.is_muted(key):
             # Answer "ok" on purpose: a failed retcode makes AstrBot retry, and
             # staying quiet is the whole point of the gate.
             log("MUTE BLOCK %s: dropping %r (%ds left)"
@@ -1279,7 +1451,7 @@ def main():
         if guard is False:
             log("another bridge is already running for %s - refusing to start" % args.config)
             log("two bridges on one AstrBot deliver every message twice")
-            log("run scripts\\stop-bridge.ps1 first if you really want a new one")
+            log("run scripts\\stop-uia-bridge.ps1 first if you really want a new one")
             sys.exit(3)
     with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
