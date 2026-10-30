@@ -705,20 +705,58 @@ class QQWindow:
         """Save the rendered pixels of one image control as a stable PNG."""
         if not image_dir:
             return None
-        rect = _nrect(node)
+        # CaptureToImage reads pixels from the screen. If the QQ window is
+        # covered, the image rectangle contains another app's pixels instead.
+        # Bring QQ forward for image material only; text reads do not steal
+        # focus. If Windows refuses SetForegroundWindow, briefly raise QQ to
+        # topmost and restore the original state after the capture.
+        temporary_topmost = False
+        was_topmost = bool(
+            _safe(
+                lambda: user32.GetWindowLongW(self.hwnd, GWL_EXSTYLE)
+                & WS_EX_TOPMOST,
+                False,
+            )
+        )
+        if not self.force_foreground():
+            if was_topmost:
+                return None
+            temporary_topmost = bool(
+                _safe(
+                    lambda: user32.SetWindowPos(
+                        self.hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                    ),
+                    False,
+                )
+            )
+            if not temporary_topmost:
+                return None
+        self.poke()
+        time.sleep(0.25)
+        tmp = ""
         try:
+            rect = _nrect(node)
             width = int(rect.right - rect.left)
             height = int(rect.bottom - rect.top)
-        except Exception:
-            return None
-        if width < 16 or height < 16 or width > 10000 or height > 10000:
-            return None
-        os.makedirs(image_dir, exist_ok=True)
-        tmp = os.path.join(
-            image_dir,
-            ".capture-%d-%d.png" % (os.getpid(), time.time_ns()),
-        )
-        try:
+            if width < 16 or height < 16 or width > 10000 or height > 10000:
+                return None
+            center = (
+                int((rect.left + rect.right) / 2),
+                int((rect.top + rect.bottom) / 2),
+            )
+            if _window_at(*center) != self.hwnd:
+                return None
+            os.makedirs(image_dir, exist_ok=True)
+            tmp = os.path.join(
+                image_dir,
+                ".capture-%d-%d.png" % (os.getpid(), time.time_ns()),
+            )
             if not _safe(lambda: node.CaptureToImage(tmp), False):
                 return None
             with open(tmp, "rb") as fh:
@@ -737,6 +775,19 @@ class QQWindow:
         except Exception:
             return None
         finally:
+            if temporary_topmost:
+                _safe(
+                    lambda: user32.SetWindowPos(
+                        self.hwnd,
+                        HWND_NOTOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                    ),
+                    False,
+                )
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
