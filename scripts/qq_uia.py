@@ -41,6 +41,7 @@ CLI:
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -519,7 +520,22 @@ class QQWindow:
 
     def _current_chat_once(self):
         self.poke()
-        for node in self._walk(self._fresh_root()):
+        root = self._fresh_root()
+        # A native UIA property search is much cheaper than walking the whole
+        # Chromium tree. The old full-tree scan made one failed switch spend
+        # minutes checking the header after every retry.
+        for control_type in (auto.ButtonControl, auto.Control):
+            header = control_type(
+                searchFromControl=root,
+                ClassName=HEADER_NAME_CLASS,
+            )
+            if header.Exists(0.25, 0.05):
+                name = _nname(header)
+                if name:
+                    return name
+        # Keep a compatibility fallback for QQ builds whose accessibility
+        # provider does not answer ClassName searches.
+        for node in self._walk(root):
             if _ntype(node) == "ButtonControl" and HEADER_NAME_CLASS in _nclass(node):
                 n = _nname(node)
                 if n:
@@ -532,6 +548,17 @@ class QQWindow:
             return self._retry(self._current_chat_once)
         except Exception:
             return ""
+
+    def _assert_chat(self, expected_chat, phase):
+        """Abort a read/send if the visible conversation changed underneath it."""
+        if not expected_chat:
+            return
+        got = self.current_chat()
+        if got != expected_chat:
+            raise RuntimeError(
+                "conversation changed %s: expected %r, now %r"
+                % (phase, expected_chat, got)
+            )
 
     # ---- session list (read without clicking) ----
 
@@ -674,7 +701,49 @@ class QQWindow:
         return self.current_chat() == want
     # ---- message parsing ----
 
-    def _parse_message(self, item):
+    def _capture_message_image(self, node, image_dir):
+        """Save the rendered pixels of one image control as a stable PNG."""
+        if not image_dir:
+            return None
+        rect = _nrect(node)
+        try:
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+        except Exception:
+            return None
+        if width < 16 or height < 16 or width > 10000 or height > 10000:
+            return None
+        os.makedirs(image_dir, exist_ok=True)
+        tmp = os.path.join(
+            image_dir,
+            ".capture-%d-%d.png" % (os.getpid(), time.time_ns()),
+        )
+        try:
+            if not _safe(lambda: node.CaptureToImage(tmp), False):
+                return None
+            with open(tmp, "rb") as fh:
+                payload = fh.read()
+            if len(payload) < 128:
+                return None
+            digest = hashlib.sha1(payload).hexdigest()[:24]
+            path = os.path.join(image_dir, "uia-%s.png" % digest)
+            os.replace(tmp, path)
+            return {
+                "path": path,
+                "sha1": digest,
+                "width": width,
+                "height": height,
+            }
+        except Exception:
+            return None
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+    def _parse_message(self, item, image_dir=None):
         """Split one message bubble into sender / text / images.
 
         QQ renders the level chip and the sender name inside the bubble too
@@ -695,7 +764,7 @@ class QQWindow:
             elif wrapper is None and "message-content__wrapper" in cls:
                 wrapper = node
         texts = []
-        images = 0
+        image_nodes = []
         for node in self._walk(wrapper if wrapper is not None else item):
             cls = _nclass(node)
             if wrapper is None and ("user-name" in cls or "group-member-label" in cls):
@@ -706,12 +775,34 @@ class QQWindow:
                 if s and not TS_RE.match(s):
                     texts.append(s)
             elif t == "ImageControl" and IMAGE_TAG in _nname(node):
-                images += 1
+                image_nodes.append(node)
         text = "".join(texts).strip()
-        if images:
+        if image_nodes:
             text = (text + " [" + IMAGE_TAG + "]") if text else ("[" + IMAGE_TAG + "]")
         if not sender and not text:
             return None
+        captured_images = []
+        for node in image_nodes:
+            captured = self._capture_message_image(node, image_dir)
+            if captured:
+                captured_images.append(captured)
+        image_shapes = []
+        for node in image_nodes:
+            rect = _nrect(node)
+            if rect is None:
+                continue
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width < 16 or height < 16:
+                continue
+            # Capture pixels change while QQ animates or repaints. Quantised
+            # control dimensions identify the same bubble much more reliably.
+            image_shapes.append([
+                max(1, int(round(width / 8.0))),
+                max(1, int(round(height / 8.0))),
+            ])
+        if image_nodes and not image_shapes:
+            image_shapes = [[0, 0] for _ in image_nodes]
         runtime_id = _safe(lambda: item.GetRuntimeId(), None)
         if runtime_id is not None:
             try:
@@ -723,18 +814,25 @@ class QQWindow:
             "text": text,
             "is_self": is_self,
             "native_id": runtime_id,
+            "image_paths": [item["path"] for item in captured_images],
+            "image_hashes": [item["sha1"] for item in captured_images],
+            "image_shapes": image_shapes,
         }
-    def read_messages(self):
+    def read_messages(self, image_dir=None, expected_chat=None):
         """Return the visible messages of the open chat, oldest first."""
+        self._assert_chat(expected_chat, "before reading")
         ml = self._msg_list()
         if ml is None:
             return None
         msgs = []
-        for node in self._walk(ml):
+        for index, node in enumerate(self._walk(ml)):
+            if index and index % 8 == 0:
+                self._assert_chat(expected_chat, "while reading")
             if _nclass(node) == "message":
-                parsed = self._parse_message(node)
+                parsed = self._parse_message(node, image_dir=image_dir)
                 if parsed:
                     msgs.append(parsed)
+        self._assert_chat(expected_chat, "after reading")
         return msgs
 
     # ---- sending ----
@@ -761,7 +859,8 @@ class QQWindow:
                 return node
         return None
 
-    def send_text(self, text, mode="enter", verify_sent=True, timeout=4.0):
+    def send_text(self, text, mode="enter", verify_sent=True, timeout=4.0,
+                  expected_chat=None):
         """Type `text` into the open conversation and actually send it.
 
         With verify_sent the call only returns once the input box is empty
@@ -770,15 +869,19 @@ class QQWindow:
         """
         if not text:
             return False
+        self._assert_chat(expected_chat, "before preparing a text send")
         if not self.force_foreground():
             raise RuntimeError("could not bring QQ to foreground; send aborted")
+        self._assert_chat(expected_chat, "while focusing QQ")
         editor = self._editor()
         if editor is None:
             raise RuntimeError("input editor not found")
         self.click_node(editor, "chat input")
+        self._assert_chat(expected_chat, "after focusing the input box")
         auto.SendKeys("{Ctrl}a", waitTime=0.05)
         time.sleep(0.1)
         pyperclip.copy(text)
+        self._assert_chat(expected_chat, "before pasting text")
         auto.SendKeys("{Ctrl}v", waitTime=0.05)
 
         # is-empty clears as soon as the pasted text lands; waiting for that
@@ -788,6 +891,7 @@ class QQWindow:
             if self.editor_empty() is False:
                 break
             time.sleep(0.1)
+        self._assert_chat(expected_chat, "after pasting text")
 
         if mode == "button":
             btn = self._send_button()
@@ -797,11 +901,15 @@ class QQWindow:
                 if _safe(lambda: btn.IsEnabled):
                     break
                 time.sleep(0.1)
+            self._assert_chat(expected_chat, "before pressing send")
             btn.Click(simulateMove=False)
         elif mode == "ctrl_enter":
+            self._assert_chat(expected_chat, "before sending text")
             auto.SendKeys("{Ctrl}{Enter}")
         else:
+            self._assert_chat(expected_chat, "before sending text")
             auto.SendKeys("{Enter}")
+        self._assert_chat(expected_chat, "after sending text")
 
         if not verify_sent:
             time.sleep(0.2)
@@ -823,11 +931,13 @@ class QQWindow:
         if mode != "button":
             btn = self._send_button()
             if btn is not None and _safe(lambda: btn.IsEnabled):
+                self._assert_chat(expected_chat, "before the send retry")
                 try:
                     self.click_node(btn, "send button")
                 except Exception:
                     pass
                 if wait_cleared(timeout):
+                    self._assert_chat(expected_chat, "after the send retry")
                     return True
         raise RuntimeError("message did not leave the input box")
 
@@ -858,7 +968,8 @@ class QQWindow:
             raise RuntimeError("could not load %s onto the clipboard (unsupported "
                                "image format?)" % abs_path) from e
 
-    def send_image(self, path, mode="enter", verify_sent=True, timeout=8.0):
+    def send_image(self, path, mode="enter", verify_sent=True, timeout=8.0,
+                   expected_chat=None):
         """Paste an image into the open conversation and send it.
 
         QQ attaches a pasted image to the editor, so the same is-empty flag
@@ -867,14 +978,17 @@ class QQWindow:
         """
         if not path or not os.path.isfile(path):
             raise RuntimeError("image not found: %s" % path)
+        self._assert_chat(expected_chat, "before preparing an image send")
         if not self.force_foreground():
             raise RuntimeError("could not bring QQ to foreground; send aborted")
+        self._assert_chat(expected_chat, "while focusing QQ")
         self.copy_image_to_clipboard(path)
         time.sleep(0.25)
         editor = self._editor()
         if editor is None:
             raise RuntimeError("input editor not found")
         self.click_node(editor, "chat input")
+        self._assert_chat(expected_chat, "after focusing the input box")
         auto.SendKeys("{Ctrl}v", waitTime=0.05)
 
         deadline = time.time() + timeout
@@ -886,14 +1000,18 @@ class QQWindow:
             time.sleep(0.15)
         if not attached:
             raise RuntimeError("image did not land in the input box")
+        self._assert_chat(expected_chat, "after pasting the image")
 
         if mode == "button":
             btn = self._send_button()
             if btn is None:
                 raise RuntimeError("send button not found")
+            self._assert_chat(expected_chat, "before pressing send")
             btn.Click(simulateMove=False)
         else:
+            self._assert_chat(expected_chat, "before sending the image")
             auto.SendKeys("{Enter}")
+        self._assert_chat(expected_chat, "after sending the image")
 
         if not verify_sent:
             time.sleep(0.3)

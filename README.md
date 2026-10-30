@@ -24,6 +24,10 @@ QQ NT 桌面客户端  <--UIA-->  本桥接  <--OneBot v11 反向 WS-->  AstrBot
   重新打开时，Chromium 会重建控件并更换全部 `RuntimeId`。桥接同时保存
   “发送者 + 内容 + 顺序”序列，用它与上一快照对齐，只推送尾部真正新增的消息，
   不会在惰性巡检时重放整段旧历史。
+- **私聊发送者归一化**：私聊只有一个对端，昵称有时出现在辅助功能树里、有时为空。
+  去重签名不再把私聊显示昵称算进消息身份，避免同一句话在窗口重绘后被当成新消息。
+- **快速会话头校验**：发送前先按控件类名直接查找 QQ 聊天头，失败才回退到完整 UIA
+  树遍历；切换失败或控件重绘时不会因为全树扫描卡住几分钟。
 - **图片**：AstrBot 发来的 `base64://` 图片段先落到 `logs\uia-outgoing`，
   再通过剪贴板粘贴进 QQ 编辑器，发送结果同样做校验。
 - **可选闭麦闸门**：兼容模式下可让桥接在收到“闭嘴”后关闭该会话的发送能力 `mute_seconds`；
@@ -49,7 +53,7 @@ QQ NT 桌面客户端  <--UIA-->  本桥接  <--OneBot v11 反向 WS-->  AstrBot
 
 ```powershell
 git clone https://github.com/seasonQAQ111/qq-onebotv11-uia-bridge.git
-cd qq-onebot-uia-bridge
+cd qq-onebotv11-uia-bridge
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item scripts\bridge-config.example.json scripts\bridge-config.json
@@ -94,6 +98,15 @@ powershell -File scripts\start-bridge.ps1
 
 日志写在 `logs\uia-bridge.log`，Python 解释器默认取仓库根目录的 `.venv`，
 也可以用 `-Python` 指定。
+
+图形控制台：
+
+```powershell
+powershell -File scripts\start-bridge-gui.ps1
+```
+
+控制台会列出本机已登录的 QQ 窗口，可把桥接固定到其中一个账号，并提供启动、
+停止、重启和实时日志。选择其他账号后需要重启桥接才会生效。
 
 后台保活与主动停止：
 

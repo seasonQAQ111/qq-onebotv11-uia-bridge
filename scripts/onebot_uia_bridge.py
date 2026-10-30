@@ -52,6 +52,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 import websockets
 
@@ -69,6 +70,7 @@ AT_MARK = "\u6d77\u65f6"  # default self nickname used for @ detection
 # in normal operation so the bridge never becomes a second, global gate.
 # The keyword list lives in bridge-config.json as well; this is the fallback.
 DEFAULT_MUTE_SECONDS = 1800
+STATE_VERSION = 4
 DEFAULT_MUTE_KEYWORDS = [
     "\u95ed\u5634", "\u9589\u5634", "\u522b\u8bf4\u4e86", "\u5225\u8aaa\u4e86", "\u522b\u8bf4\u8bdd", "\u522b\u8bf4\u8bdd\u4e86",
     "\u5c11\u8bf4\u8bdd", "\u5c11\u8bf4\u70b9", "\u5c11\u8bf4\u4e24\u53e5", "\u8bdd\u592a\u591a", "\u8a71\u592a\u591a", "\u8bdd\u771f\u591a",
@@ -176,11 +178,30 @@ def sig_of(m):
     return (bool(m.get("is_self")), "text:" + str(m.get("text", "")))
 
 
-def content_sig_of(m):
+def content_sig_of(m, chat=None):
     """Identity that survives Chromium destroying and rebuilding its UIA nodes."""
+    image_shapes = []
+    for shape in (m.get("image_shapes") or []):
+        try:
+            image_shapes.append("%dx%d" % (int(shape[0]), int(shape[1])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if image_shapes:
+        image_sig = "shapes:" + ",".join(image_shapes)
+    else:
+        image_count = len(m.get("image_paths") or m.get("image_hashes") or [])
+        image_sig = ("count:%d" % image_count) if image_count else ""
+    sender = str(m.get("sender") or "")
+    # A private chat has exactly one peer, so the nickname is not part of a
+    # message's identity. Chromium sometimes exposes it and sometimes leaves it
+    # empty; treating those renderings as different signatures replayed old
+    # messages after a short-snapshot repaint.
+    if chat and chat.get("kind") == "private":
+        sender = ""
     return (
         bool(m.get("is_self")),
-        "content:%s\0%s" % (m.get("sender", ""), m.get("text", "")),
+        "content:%s\0%s\0images:%s"
+        % (sender, m.get("text", ""), image_sig),
     )
 
 
@@ -189,8 +210,9 @@ def diff_since(prev_sigs, cur, sig_fn=sig_of):
 
     QQ keeps only the tail of a conversation on screen, so the snapshot slides
     between polls and the head of the new list is usually *not* a continuation
-    of the old one. First try the positional overlap; when that lines up,
-    everything past the overlap is genuinely new.
+    of the old one. A new snapshot can also grow backwards and contain older
+    rows before the previous tail. Find the longest suffix of the old snapshot
+    anywhere in the new one; everything after that overlap is genuinely new.
 
     When it does not line up the snapshot may even be half rendered, so only
     signatures that were absent from the previous snapshot are offered and the
@@ -201,9 +223,17 @@ def diff_since(prev_sigs, cur, sig_fn=sig_of):
     cur_sigs = [sig_fn(m) for m in cur]
     if not prev_sigs:
         return list(cur), True
-    for k in range(min(len(prev_sigs), len(cur_sigs)), 0, -1):
-        if cur_sigs[:k] == list(prev_sigs)[-k:]:
-            return cur[k:], True
+    max_overlap = min(len(prev_sigs), len(cur_sigs))
+    min_overlap = min(4, max_overlap)
+    prev_list = list(prev_sigs)
+    for k in range(max_overlap, min_overlap - 1, -1):
+        needle = prev_list[-k:]
+        # Messages append to the tail. If identical content occurs multiple
+        # times, align the old tail to its earliest occurrence so a newly sent
+        # duplicate remains after the overlap instead of being swallowed.
+        for start in range(0, len(cur_sigs) - k + 1):
+            if cur_sigs[start:start + k] == needle:
+                return cur[start + k:], True
     budget = collections.Counter(prev_sigs)
     fresh = []
     for m in cur:
@@ -243,6 +273,37 @@ class UiaBackend:
         self.qq = None
         self.lock = threading.RLock()
         self.last_qq_launch_ts = 0.0
+        image_dir = str(cfg.get("incoming_image_dir") or "").strip()
+        if not image_dir:
+            image_dir = os.path.join(
+                os.path.dirname(HERE), "logs", "uia-incoming"
+            )
+        elif not os.path.isabs(image_dir):
+            image_dir = os.path.join(os.path.dirname(HERE), image_dir)
+        self.incoming_image_dir = image_dir
+        self.prune_incoming_images()
+
+    def prune_incoming_images(self, max_age_seconds=86400):
+        """Drop captured images after AstrBot has had a full day to consume them."""
+        if not os.path.isdir(self.incoming_image_dir):
+            return
+        cutoff = time.time() - max(3600, int(max_age_seconds))
+        removed = 0
+        try:
+            for name in os.listdir(self.incoming_image_dir):
+                if not name.startswith(("uia-", ".capture-")):
+                    continue
+                path = os.path.join(self.incoming_image_dir, name)
+                try:
+                    if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                        os.remove(path)
+                        removed += 1
+                except OSError:
+                    continue
+        except OSError:
+            return
+        if removed:
+            log("pruned %d old incoming image(s)" % removed)
 
     # ---- attach ----
 
@@ -364,12 +425,22 @@ class UiaBackend:
         """Messages of `chat`, or None when it could not be read."""
         with self.lock:
             self._ensure_root()
-            if self.qq.current_chat() != chat["name"]:
+            target = chat["name"]
+            if self.qq.current_chat() != target:
                 if self.cfg.get("read_mode", "watch") == "active":
                     return None       # never move the mouse while polling
                 if not self.switch(chat):
                     return None
-            return self.qq.read_messages()
+            msgs = self.qq.read_messages(
+                image_dir=self.incoming_image_dir,
+                expected_chat=target,
+            )
+            got = self.qq.current_chat()
+            if got != target:
+                log("READ DISCARD: wanted %r, QQ ended on %r; snapshot was not sent"
+                    % (target, got))
+                return None
+            return msgs
 
     def send_parts(self, chat, parts):
         """Send text/image parts in order into `chat` and nowhere else.
@@ -386,9 +457,13 @@ class UiaBackend:
                 if self.qq.current_chat() != chat["name"]:
                     raise RuntimeError("conversation changed mid-send")
                 if kind == "text":
-                    self.qq.send_text(payload, mode)
+                    self.qq.send_text(
+                        payload, mode, expected_chat=chat["name"]
+                    )
                 else:
-                    self.qq.send_image(payload, mode)
+                    self.qq.send_image(
+                        payload, mode, expected_chat=chat["name"]
+                    )
             if self.qq.current_chat() != chat["name"]:
                 raise RuntimeError("conversation changed while sending")
     def send_text(self, chat, text):
@@ -403,7 +478,11 @@ class UiaBackend:
                 raise RuntimeError("could not switch QQ to %r" % chat["name"])
             if self.qq.current_chat() != chat["name"]:
                 raise RuntimeError("conversation changed right before sending")
-            self.qq.send_text(text, self.cfg.get("send_mode", "enter"))
+            self.qq.send_text(
+                text,
+                self.cfg.get("send_mode", "enter"),
+                expected_chat=chat["name"],
+            )
             if self.qq.current_chat() != chat["name"]:
                 raise RuntimeError("conversation changed while sending")
 
@@ -444,6 +523,8 @@ class Bridge:
         self.content_history = {}  # chat key -> [repaint-stable signature, ...]
         self.reported = {}    # chat key -> Counter of signatures already pushed
         self.reported_order = {}   # chat key -> FIFO used to cap that Counter
+        self.reported_content = {}  # chat key -> Counter of repaint-stable signatures
+        self.reported_content_order = {}  # FIFO used to cap that Counter
         self.recent_text = {}      # chat key -> deque of (text, when) pushed
         self.deferred = {}    # chat key -> chat held back during a send burst
         self.forced_reads = set()  # chats opened by the periodic safety sweep
@@ -633,12 +714,23 @@ class Bridge:
             nickname = m["sender"] or "unknown"
             uid = self.uid_for(chat, nickname)
         text = m["text"]
+        image_paths = [
+            path for path in (m.get("image_paths") or [])
+            if path and os.path.isfile(path)
+        ]
         segments = []
         if chat["kind"] == "group" and not m["is_self"] and text:
             if re.search(r"@\s*" + re.escape(self.nick), text):
                 segments.append({"type": "at", "data": {"qq": self.self_id, "name": self.nick}})
-        if text:
+        # A successfully captured image already becomes an Image component.
+        # Keep a pure-image placeholder only when capture failed.
+        if text and not (image_paths and text.strip() == "[" + qq_uia.IMAGE_TAG + "]"):
             segments.append({"type": "text", "data": {"text": text}})
+        for image_path in image_paths:
+            segments.append({
+                "type": "image",
+                "data": {"file": Path(image_path).resolve().as_uri()},
+            })
         base = {
             "post_type": "message",
             "time": now_ts(),
@@ -837,6 +929,18 @@ class Bridge:
 
     def poll_watch(self):
         changed = self._changed_chats()
+        try:
+            active_name = self.backend.current_chat()
+        except Exception:
+            active_name = ""
+        active_chat = next(
+            (chat for chat in self.chats if active_name and chat["name"] == active_name),
+            None,
+        )
+        if active_chat is not None:
+            active_key = chat_key(active_chat)
+            if all(chat_key(chat) != active_key for chat in changed):
+                changed.insert(0, active_chat)
         if self._in_send_hold():
             for chat in changed:
                 self.deferred[chat_key(chat)] = chat
@@ -900,17 +1004,23 @@ class Bridge:
         prev = self.history.get(key)
         prev_content = self.content_history.get(key)
 
-        # The first successful snapshot after a bridge restart is always a
-        # baseline. It may contain hours of history loaded by a fresh QQ
-        # login, so even a "trusted" diff must not be forwarded to AstrBot.
+        # The first snapshot after a bridge restart must not blindly replay
+        # hours of QQ history. When persisted signatures exist, compare the
+        # current screen with them so messages received while the bridge was
+        # down are recovered. With no state, establish a baseline instead.
         if first_read:
-            log("baseline %s after start: %d messages" % (key, len(msgs)))
-            self._remember(key, msgs)
-            self.history[key] = [sig_of(m) for m in msgs][-400:]
-            self.content_history[key] = [content_sig_of(m) for m in msgs][-400:]
-            self.read_once.add(key)
-            self.save_state()
-            return
+            if not prev or not prev_content or not self.reported_content.get(key):
+                log("baseline %s after start: %d messages" % (key, len(msgs)))
+                self._remember(key, msgs, chat)
+                self.history[key] = [sig_of(m) for m in msgs][-400:]
+                self.content_history[key] = [
+                    content_sig_of(m, chat) for m in msgs
+                ][-400:]
+                self.read_once.add(key)
+                self.save_state()
+                return
+            log("restart recovery %s: comparing %d visible message(s) with saved state"
+                % (key, len(msgs)))
 
         prev_shape = prev
         shape_sig = sig_of
@@ -918,7 +1028,7 @@ class Bridge:
             runtime_overlap = tail_overlap(prev, [sig_of(m) for m in msgs])
             if runtime_overlap == 0:
                 prev_shape = prev_content
-                shape_sig = content_sig_of
+                shape_sig = lambda m: content_sig_of(m, chat)
 
         if self._looks_partial(prev_shape, msgs, shape_sig):
             # A short view can mean either that Chromium is still repainting or
@@ -951,16 +1061,19 @@ class Bridge:
         fresh, trusted = diff_since(prev, msgs)
         if not trusted and prev_content:
             content_fresh, content_trusted = diff_since(
-                prev_content, msgs, sig_fn=content_sig_of
+                prev_content,
+                msgs,
+                sig_fn=lambda m: content_sig_of(m, chat),
             )
             if content_trusted:
-                log("reconciled repainted snapshot for %s: %d new message(s)"
-                    % (key, len(content_fresh)))
+                if content_fresh:
+                    log("reconciled repainted snapshot for %s: %d new message(s)"
+                        % (key, len(content_fresh)))
                 fresh = content_fresh
                 trusted = True
 
         cur_sigs = [sig_of(m) for m in msgs]
-        cur_content = [content_sig_of(m) for m in msgs]
+        cur_content = [content_sig_of(m, chat) for m in msgs]
         if trusted:
             if len(cur_sigs) >= len(prev):
                 self.history[key] = cur_sigs[-400:]
@@ -970,44 +1083,52 @@ class Bridge:
                 # messages, and append only what this read actually added.
                 self.history[key] = (list(prev) + [sig_of(m) for m in fresh])[-400:]
         else:
-            if forced:
-                # The periodic safety read had to reopen a hidden conversation,
-                # so Chromium replaced every RuntimeId. If even the repaint-
-                # stable sequence cannot be aligned, replaying this screen
-                # would send old history to AstrBot again. Re-baseline instead.
-                log("forced read %s had no trusted overlap; ignoring snapshot" % key)
+            # Chromium can replace every RuntimeId after QQ reopens or repaints.
+            # Do not discard the whole screen: use the persisted content counter
+            # to keep only occurrences that have not already reached AstrBot.
+            # Duplicate content remains valid when the current screen contains
+            # more occurrences than the previous one.
+            untrusted_limit = max(
+                0,
+                int(self.cfg.get("max_untrusted_snapshot_messages", 50) or 0),
+            )
+            if untrusted_limit and len(fresh) > untrusted_limit:
+                log("untrusted snapshot for %s: %d candidates; ignoring it to prevent replay"
+                    % (key, len(fresh)))
                 self.history[key] = cur_sigs[-400:]
                 self.content_history[key] = cur_content[-400:]
                 self.read_once.add(key)
                 self.save_state()
                 return
-            already = self.reported.get(key) or collections.Counter()
-            window = float(self.cfg.get("dedupe_window_seconds", 180) or 0)
-            now = time.time()
-            recent = self.recent_text.setdefault(key, collections.deque(maxlen=300))
+            already = collections.Counter(self.reported.get(key) or {})
+            already_content = collections.Counter(self.reported_content.get(key) or {})
             kept = []
             for m in fresh:
-                text = m["text"]
-                seen_now = any(t == text and now - ts < window for t, ts in recent)
-                if already[sig_of(m)] > 0 or seen_now:
-                    log("skip %s: %r looks like a re-render, not a new message"
-                        % (key, text[:40]))
+                runtime_sig = sig_of(m)
+                content_sig = content_sig_of(m, chat)
+                if already[runtime_sig] > 0:
+                    already[runtime_sig] -= 1
+                    continue
+                if already_content[content_sig] > 0:
+                    already_content[content_sig] -= 1
                     continue
                 kept.append(m)
-            log("untrusted snapshot for %s: %d of %d messages looked new"
-                % (key, len(kept), len(msgs)))
+            source = "forced read" if forced else "untrusted snapshot"
+            log("%s for %s recovered %d of %d unrecorded message(s)"
+                % (source, key, len(kept), len(msgs)))
             fresh = kept
+            self.history[key] = cur_sigs[-400:]
 
         if trusted and len(cur_content) < len(prev_content or []):
             self.content_history[key] = (
                 list(prev_content or [])
-                + [content_sig_of(m) for m in fresh]
+                + [content_sig_of(m, chat) for m in fresh]
             )[-400:]
         else:
             self.content_history[key] = cur_content[-400:]
 
         for m in fresh:
-            self._mark_reported(key, m)
+            self._mark_reported(key, m, chat)
             if m["is_self"] and not self.emit_self:
                 continue
             text = m.get("text", "")
@@ -1018,26 +1139,36 @@ class Bridge:
                 continue
             self.emit(self.build_event(chat, m))
         self.read_once.add(key)
-        self.save_state()
+        if first_read or fresh:
+            self.save_state()
 
-    def _mark_reported(self, key, m):
+    def _mark_reported(self, key, m, chat=None):
         counter = self.reported.setdefault(key, collections.Counter())
         order = self.reported_order.setdefault(key, collections.deque())
-        recent = self.recent_text.setdefault(key, collections.deque(maxlen=300))
         sig = sig_of(m)
+        content_counter = self.reported_content.setdefault(key, collections.Counter())
+        content_order = self.reported_content_order.setdefault(key, collections.deque())
+        content_sig = content_sig_of(m, chat)
         counter[sig] += 1
         order.append(sig)
-        recent.append((m.get("text", ""), time.time()))
+        content_counter[content_sig] += 1
+        content_order.append(content_sig)
         while len(order) > 500:
             old = order.popleft()
             if counter[old] > 0:
                 counter[old] -= 1
                 if counter[old] == 0:
                     del counter[old]
+        while len(content_order) > 500:
+            old = content_order.popleft()
+            if content_counter[old] > 0:
+                content_counter[old] -= 1
+                if content_counter[old] == 0:
+                    del content_counter[old]
 
-    def _remember(self, key, msgs):
+    def _remember(self, key, msgs, chat=None):
         for m in msgs:
-            self._mark_reported(key, m)
+            self._mark_reported(key, m, chat)
 
     # ---------- dedupe state that survives a restart ----------
 
@@ -1058,9 +1189,15 @@ class Bridge:
         except Exception as e:
             log("could not read dedupe state %s: %s" % (path, e))
             return
+        try:
+            state_version = int(blob.get("version") or 1)
+        except (TypeError, ValueError):
+            state_version = 1
+        content_state_current = state_version >= STATE_VERSION
         window = max(float(self.cfg.get("dedupe_window_seconds", 180) or 0), 60.0)
         now = time.time()
         loaded = 0
+        rebuilt_content = 0
         for key, item in (blob.get("chats") or {}).items():
             if not isinstance(item, dict):
                 continue
@@ -1068,17 +1205,33 @@ class Bridge:
                 hist = [(bool(s[0]), str(s[1])) for s in (item.get("history") or [])]
                 if hist:
                     self.history[key] = hist[-400:]
-                content_hist = [
-                    (bool(s[0]), str(s[1]))
-                    for s in (item.get("content_history") or [])
-                ]
-                if content_hist:
-                    self.content_history[key] = content_hist[-400:]
+                content_hist = []
+                if content_state_current:
+                    content_hist = [
+                        (bool(s[0]), str(s[1]))
+                        for s in (item.get("content_history") or [])
+                    ]
+                    if content_hist:
+                        self.content_history[key] = content_hist[-400:]
                 counter = collections.Counter()
                 for entry in (item.get("reported") or []):
                     counter[(bool(entry[0]), str(entry[1]))] += int(entry[2])
                 if counter:
                     self.reported[key] = counter
+                if content_state_current:
+                    content_counter = collections.Counter()
+                    for entry in (item.get("reported_content") or []):
+                        content_counter[(bool(entry[0]), str(entry[1]))] += int(entry[2])
+                    if not content_counter:
+                        # Older current-version state files only have history.
+                        content_counter.update(content_hist)
+                    if content_counter:
+                        self.reported_content[key] = content_counter
+                        self.reported_content_order[key] = collections.deque(
+                            content_counter.elements()
+                        )
+                else:
+                    rebuilt_content += 1
                 recent = collections.deque(maxlen=300)
                 for text, ts in (item.get("recent") or []):
                     if now - float(ts) < window:
@@ -1089,6 +1242,10 @@ class Bridge:
             except Exception:
                 continue
         if loaded:
+            if rebuilt_content:
+                log("dedupe state v%d upgraded: rebuilt stable content signatures "
+                    "for %d chat(s) without replaying their current history"
+                    % (STATE_VERSION, rebuilt_content))
             log("dedupe state restored for %d chat(s)" % loaded)
 
     def save_state(self):
@@ -1101,6 +1258,7 @@ class Bridge:
         chats = {}
         for key, hist in self.history.items():
             counter = self.reported.get(key) or collections.Counter()
+            content_counter = self.reported_content.get(key) or collections.Counter()
             recent = self.recent_text.get(key) or collections.deque()
             chats[key] = {
                 "history": [[bool(s[0]), s[1]] for s in hist[-400:]],
@@ -1109,6 +1267,10 @@ class Bridge:
                     for s in (self.content_history.get(key) or [])[-400:]
                 ],
                 "reported": [[bool(s[0]), s[1], int(n)] for s, n in counter.items()],
+                "reported_content": [
+                    [bool(s[0]), s[1], int(n)]
+                    for s, n in content_counter.items()
+                ],
                 "recent": [[t, ts] for t, ts in recent if now - ts < window],
             }
         tmp = path + ".tmp"
@@ -1117,7 +1279,8 @@ class Bridge:
             if parent:
                 os.makedirs(parent, exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump({"version": 2, "chats": chats}, fh, ensure_ascii=False)
+                json.dump({"version": STATE_VERSION, "chats": chats}, fh,
+                          ensure_ascii=False)
             os.replace(tmp, path)
         except Exception as e:
             log("could not write dedupe state: %s" % e)
@@ -1451,7 +1614,7 @@ def main():
         if guard is False:
             log("another bridge is already running for %s - refusing to start" % args.config)
             log("two bridges on one AstrBot deliver every message twice")
-            log("run scripts\\stop-uia-bridge.ps1 first if you really want a new one")
+            log("run scripts\\stop-bridge.ps1 first if you really want a new one")
             sys.exit(3)
     with open(args.config, encoding="utf-8") as f:
         cfg = json.load(f)
